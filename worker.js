@@ -1135,12 +1135,21 @@ async function createSpamTopic(groupId) {
 // 转发消息到垃圾话题
 async function forwardToSpamTopic(message, groupId, topicId) {
   try {
-    await forwardMessage({
+    const result = await forwardMessage({
       chat_id: groupId,
       message_thread_id: topicId,
       from_chat_id: message.chat.id,
       message_id: message.message_id
     });
+    if (result.ok && result.result && result.result.message_id) {
+      await KV.put('msg-map-' + result.result.message_id, message.chat.id.toString(), { expirationTtl: 172800 });
+      await KV.put('spam-orig-' + result.result.message_id, message.message_id.toString(), { expirationTtl: 172800 });
+      const userId = message.from ? String(message.from.id) : message.chat.id.toString();
+      const threadId = await KV.get(`user:${userId}:topic`);
+      if (threadId) {
+        await KV.put('spam-thread-' + result.result.message_id, threadId, { expirationTtl: 172800 });
+      }
+    }
     return true;
   } catch (e) {
     Logger.error('forward_to_spam_topic_failed', e, { topicId });
@@ -1171,19 +1180,46 @@ async function silentlyForwardSpamMessage(message, groupId, topicId) {
 // 从垃圾话题恢复消息
 async function restoreMessageFromSpamTopic(groupId, spamTopicId, targetTopicId, messageId) {
   try {
-    // 转发回正常话题
-    await forwardMessage({
-      chat_id: groupId,
-      message_thread_id: targetTopicId,
-      from_chat_id: groupId,
-      message_id: messageId
-    });
+    const guestChatId = await KV.get('msg-map-' + messageId);
+    const origMessageId = await KV.get('spam-orig-' + messageId);
 
-    Logger.info('message_restored_from_spam', { groupId, spamTopicId, targetTopicId, messageId });
-    return true;
+    if (!guestChatId) {
+      Logger.warn('restore_spam_no_mapping', { messageId });
+      return { success: false, reason: 'no_mapping' };
+    }
+
+    const isTopicMode = await isTopicForwardingEnabled();
+    if (isTopicMode && targetTopicId) {
+      const forwardResult = await forwardMessage({
+        chat_id: groupId,
+        message_thread_id: targetTopicId,
+        from_chat_id: groupId,
+        message_id: messageId
+      });
+      if (forwardResult.ok && forwardResult.result && forwardResult.result.message_id) {
+        await KV.put('msg-map-' + forwardResult.result.message_id, guestChatId, { expirationTtl: 172800 });
+        await KV.put('orig-map-' + (origMessageId || forwardResult.result.message_id), forwardResult.result.message_id.toString(), { expirationTtl: 172800 });
+        await KV.put('fwd-loc-' + forwardResult.result.message_id, JSON.stringify({ chat_id: groupId, thread_id: targetTopicId }), { expirationTtl: 172800 });
+      }
+    } else {
+      const copyResult = await copyMessage({
+        chat_id: guestChatId,
+        from_chat_id: groupId,
+        message_id: messageId
+      });
+      if (copyResult.ok && copyResult.result && copyResult.result.message_id) {
+        await KV.put('admin-reply-map-' + messageId, JSON.stringify({
+          guestChatId: guestChatId,
+          guestMessageId: copyResult.result.message_id
+        }), { expirationTtl: 172800 });
+      }
+    }
+
+    Logger.info('message_restored_from_spam', { groupId, spamTopicId, targetTopicId, messageId, guestChatId });
+    return { success: true, guestChatId };
   } catch (e) {
     Logger.error('restore_message_failed', e);
-    return false;
+    return { success: false, reason: 'error', error: e };
   }
 }
 
@@ -4905,7 +4941,7 @@ async function handleAdminMessage(message) {
 
   // 【修复】检查是否以 / 开头但不是有效命令
   // 如果是无效命令且是回复消息，防止转发给用户
-  const validCommands = ['/help', '/menu', '/welcome', '/autoreply', '/ban', '/unban', '/reset', '/trust', '/untrust', '/broadcast', '/bcancel'];
+  const validCommands = ['/help', '/menu', '/welcome', '/autoreply', '/ban', '/unban', '/reset', '/trust', '/untrust', '/broadcast', '/bcancel', '/restore'];
   const isValidCommand = validCommands.some(cmd => text === cmd || text.startsWith(cmd + ' '));
   const isCommandLike = text.startsWith('/') && text.length > 1;
 
@@ -5298,6 +5334,57 @@ async function handleAdminMessage(message) {
       text: '✅ 已清空所有缓存\n\nL1 内存缓存和统计信息已重置。\nL2 KV 缓存将在到期后自动清理。',
       parse_mode: 'HTML'
     });
+  }
+
+  // 指令：/restore - 从垃圾话题恢复消息
+  if (text === '/restore' && reply) {
+    const spamTopicConfig = await getSpamTopicConfig();
+    const isTopicMode = await isTopicForwardingEnabled();
+
+    if (!spamTopicConfig.topicId || !(await isSpamTopicEnabled())) {
+      return sendMessage({
+        chat_id: adminChatId,
+        text: '⚠️ 垃圾话题功能未启用，无法恢复消息。'
+      });
+    }
+
+    const replyChatIdStr = reply.chat?.id ? String(reply.chat.id) : null;
+    if (replyChatIdStr !== GROUP_ID || !reply.message_thread_id || String(reply.message_thread_id) !== String(spamTopicConfig.topicId)) {
+      return sendMessage({
+        chat_id: adminChatId,
+        text: '⚠️ 请回复垃圾话题中的消息来恢复。\n\n提示：只有垃圾话题中的消息才能被恢复。'
+      });
+    }
+
+    const targetThreadId = isTopicMode ? await KV.get('spam-thread-' + reply.message_id) : null;
+    const restoreResult = await restoreMessageFromSpamTopic(GROUP_ID, spamTopicConfig.topicId, targetThreadId, reply.message_id);
+
+    if (restoreResult.success) {
+      if (isTopicMode && targetThreadId) {
+        await sendMessage({
+          chat_id: adminChatId,
+          text: `✅ 消息已恢复到用户话题\n\nUID: <code>${restoreResult.guestChatId}</code>\n话题 ID: <code>${targetThreadId}</code>`,
+          parse_mode: 'HTML'
+        });
+      } else {
+        await sendMessage({
+          chat_id: adminChatId,
+          text: `✅ 消息已恢复并发送给用户\n\nUID: <code>${restoreResult.guestChatId}</code>`,
+          parse_mode: 'HTML'
+        });
+      }
+    } else if (restoreResult.reason === 'no_mapping') {
+      await sendMessage({
+        chat_id: adminChatId,
+        text: '⚠️ 未找到消息映射关系，无法恢复。\n\n可能原因：消息映射已过期（超过48小时）或消息不是通过垃圾话题功能转发的。'
+      });
+    } else {
+      await sendMessage({
+        chat_id: adminChatId,
+        text: '❌ 恢复消息失败，请稍后重试。'
+      });
+    }
+    return;
   }
 
   // --- 普通回复逻辑 ---
