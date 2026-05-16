@@ -44,17 +44,6 @@
 | **Turnstile Site Key** | Cloudflare Dashboard 创建 | 人机验证 |
 | **Turnstile Secret Key** | Cloudflare Dashboard 创建 | 人机验证 |
 
-### 部署步骤
-
-```bash
-# 克隆项目
-git clone https://github.com/qianqi32/SafeRelay.git
-cd SafeRelay
-
-# 将 worker.js 复制到 Cloudflare Workers 编辑器中
-# 所有密钥通过环境变量注入，无需修改代码
-```
-
 ### 环境变量配置
 
 进入 `Workers & Pages` → 你的 Worker → `设置` → `变量和机密`：
@@ -236,6 +225,18 @@ SafeRelay/
 - 提供源代码
 
 详见 [LICENSE](./LICENSE) 文件。
+
+---
+
+## ⭐ Star History
+
+<a href="https://www.star-history.com/?repos=qianqi32%2FSafeRelay&type=date&legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=qianqi32/SafeRelay&type=date&theme=dark&legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=qianqi32/SafeRelay&type=date&legend=top-left" />
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=qianqi32/SafeRelay&type=date&legend=top-left" />
+  </picture>
+</a>
 
 ---
 
