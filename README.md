@@ -32,35 +32,9 @@
 
 ## 🚀 快速开始
 
-> 详细部署步骤请参考 **[DEPLOY.md](./DEPLOY.md)**
+请直接查看详细部署教程：**[DEPLOY.md](./DEPLOY.md)**。
 
-### 前置准备
-
-| 项目 | 获取方式 | 用途 |
-| ---- | -------- | ---- |
-| **Telegram Bot Token** | [@BotFather](https://t.me/BotFather) 创建机器人 | 机器人身份认证 |
-| **Admin UID** | [@userinfobot](https://t.me/userinfobot) 获取你的 TG ID | 管理员身份验证 |
-| **Webhook 密钥** | [UUID 生成器](https://www.uuidgenerator.net/) 生成随机 UUID | Webhook 安全验证 |
-| **Turnstile Site Key** | Cloudflare Dashboard 创建 | 人机验证 |
-| **Turnstile Secret Key** | Cloudflare Dashboard 创建 | 人机验证 |
-
-### 环境变量配置
-
-进入 `Workers & Pages` → 你的 Worker → `设置` → `变量和机密`：
-
-| 变量 | 类型 | 说明 | 示例 |
-| :--: | :--: | :--- | :--: |
-| `ENV_BOT_TOKEN` | 密钥 | Telegram Bot Token | `123456:ABC-DEF...` |
-| `ENV_BOT_SECRET` | 密钥 | Webhook 安全验证 UUID | `d7ecca95-e45e-41f4-b018-d5cc05486283` |
-| `ENV_ADMIN_UID` | 文本 | 管理员 TG ID（可多个，逗号分隔） | `123456789` |
-| `CF_TURNSTILE_SITE_KEY` | 密钥 | Turnstile 站点密钥 | `0x4AAAAAA...` |
-| `CF_TURNSTILE_SECRET_KEY` | 密钥 | Turnstile 密钥 | `0x4AAAAAA...` |
-
-### 首次使用
-
-1. 访问 `https://<你的Worker域名>/registerWebhook` 注册 Webhook
-2. 向机器人发送 `/start` 开始对话
-3. 发送 `/menu` 打开管理面板进行配置
+部署、环境变量、Webhook 激活、Turnstile 配置和话题模式开启步骤都以 `DEPLOY.md` 为准。
 
 ---
 

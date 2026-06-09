@@ -1,8 +1,8 @@
 /**
  * SafeRelay - Telegram 私聊机器人
  * 项目地址: https://github.com/qianqi32/SafeRelay
- * 版本: 1.0.7
- * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
+ * 版本: 1.0.8
+ * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues 或者直接联系 @KiyukieBot
 */
 
 // 基础配置
@@ -620,6 +620,7 @@ async function checkFraud(userId) {
 
 // 话题健康状态缓存（内存缓存）
 const threadHealthCache = new Map();
+const topicCreateInFlight = new Map();
 
 /**
  * 验证话题是否有效（带缓存）
@@ -629,6 +630,9 @@ const threadHealthCache = new Map();
  */
 async function validateForumThread(groupId, threadId) {
   if (!groupId || !threadId) return false;
+
+  const closedStatus = await KV.get(`thread_closed:${threadId}`);
+  if (closedStatus === '1') return false;
 
   const cacheKey = `thread:${threadId}`;
   const now = Date.now();
@@ -731,6 +735,18 @@ async function pingForumThread(groupId, threadId) {
   } catch (e) {
     Logger.error('thread_probe_ping_error', e, { threadId, groupId });
     return true;
+  }
+}
+
+async function updateThreadClosedStatus(threadId, closed) {
+  if (!threadId) return;
+  const key = `thread_closed:${threadId}`;
+  if (closed) {
+    await KV.put(key, '1', { expirationTtl: 172800 });
+    threadHealthCache.set(`thread:${threadId}`, { ok: false, ts: Date.now() });
+  } else {
+    await safeKvDelete(key);
+    threadHealthCache.delete(`thread:${threadId}`);
   }
 }
 
@@ -1237,9 +1253,10 @@ async function silentlyForwardSpamMessage(message, groupId, topicId) {
     // 转发到垃圾话题
     await forwardToSpamTopic(message, groupId, topicId);
 
-    // 通知管理员
+    // 通知到垃圾话题，避免群组模式下打扰管理员私聊
     await sendMessage({
-      chat_id: ADMIN_UID,
+      chat_id: groupId,
+      message_thread_id: topicId,
       text: `🗑 <b>垃圾消息已静默处理</b>\n\nUID: <code>${message.from?.id}</code>\n话题 ID: <code>${topicId}</code>\n\n<i>消息已转发到垃圾话题，用户无感知</i>`,
       parse_mode: 'HTML'
     });
@@ -1304,6 +1321,22 @@ async function restoreMessageFromSpamTopic(groupId, spamTopicId, targetTopicId, 
 
 // ========== 用户话题管理 ==========
 async function ensureUserTopic(userId, profile = null) {
+  const inFlightKey = String(userId);
+  const inFlight = topicCreateInFlight.get(inFlightKey);
+  if (inFlight) return inFlight;
+
+  const promise = ensureUserTopicInternal(userId, profile);
+  topicCreateInFlight.set(inFlightKey, promise);
+  try {
+    return await promise;
+  } finally {
+    if (topicCreateInFlight.get(inFlightKey) === promise) {
+      topicCreateInFlight.delete(inFlightKey);
+    }
+  }
+}
+
+async function ensureUserTopicInternal(userId, profile = null) {
   if (!GROUP_ID) {
     Logger.warn('ensure_user_topic_no_group_id', { userId });
     return null;
@@ -1490,20 +1523,13 @@ async function releaseTopicLock(userId, token) {
 }
 
 function buildUserTopicTitle(userId, profile = null) {
-  const parts = [];
+  let displayName = '';
   if (profile) {
-    if (profile.first_name || profile.last_name) {
-      parts.push(`${profile.first_name || ''} ${profile.last_name || ''}`.trim());
-    }
-    if (profile.username) {
-      parts.push(`@${profile.username}`);
-    }
+    displayName = `${profile.first_name || ''} ${profile.last_name || ''}`.trim();
   }
+  if (!displayName) displayName = '访客';
 
-  let base = parts.filter(Boolean).join(' ');
-  if (!base) base = `访客 ${userId}`;
-
-  let title = `#${userId} ${base}`.trim();
+  let title = `${displayName}（${userId}）`;
   if (title.length > 60) {
     title = title.slice(0, 60);
   }
@@ -1521,7 +1547,7 @@ async function sendTopicWelcomeMessage(threadId, userId, profile = null) {
       lines.push(`用户名：@${escapeHtml(profile.username)}`);
     }
     if (profile?.first_name || profile?.last_name) {
-      lines.push(`姓名：${escapeHtml(`${profile.first_name || ''} ${profile.last_name || ''}`.trim())}`);
+      lines.push(`昵称：${escapeHtml(`${profile.first_name || ''} ${profile.last_name || ''}`.trim())}`);
     }
     lines.push('\n请在此话题内回复用户消息。');
 
@@ -2193,6 +2219,19 @@ function pendingQueueKey(userId) {
   return `pending_queue:${userId}`;
 }
 
+function pendingMessageKey(userId, messageId) {
+  return `pending_msg:${userId}:${messageId}`;
+}
+
+function buildPendingMessageSnapshot(message, userId) {
+  return {
+    chat: { id: userId },
+    message_id: message.message_id,
+    text: message.text || '',
+    caption: message.caption || ''
+  };
+}
+
 // 获取用户的暂存消息队列
 async function getPendingQueue(userId) {
   try {
@@ -2207,13 +2246,20 @@ async function getPendingQueue(userId) {
 }
 
 // 添加消息到暂存队列（带去重）
-async function appendPendingQueue(userId, messageId) {
+async function appendPendingQueue(userId, message) {
+  const messageId = typeof message === 'object' ? message.message_id : message;
   const mid = Number(messageId);
   if (!Number.isFinite(mid) || mid <= 0) return await getPendingQueue(userId);
 
   // 【优化】使用 safeGetJSON 安全读取
   let arr = await safeGetJSON(pendingQueueKey(userId), []);
   if (!Array.isArray(arr)) arr = [];
+
+  if (message && typeof message === 'object') {
+    await KV.put(pendingMessageKey(userId, mid), JSON.stringify(buildPendingMessageSnapshot(message, userId)), {
+      expirationTtl: CONFIG.PENDING_QUEUE_TTL_SECONDS
+    });
+  }
 
   // 【优化】去重检查：避免同一消息重复添加
   if (arr.includes(mid)) {
@@ -2245,6 +2291,18 @@ async function clearPendingQueue(userId) {
     await KV.delete(pendingQueueKey(userId));
   } catch (e) {
     Logger.error('clear_pending_queue_failed', e, { userId });
+  }
+}
+
+async function getPendingMessageSnapshot(userId, messageId) {
+  return await safeGetJSON(pendingMessageKey(userId, messageId), null);
+}
+
+async function deletePendingMessageSnapshot(userId, messageId) {
+  try {
+    await KV.delete(pendingMessageKey(userId, messageId));
+  } catch (e) {
+    Logger.warn('delete_pending_message_snapshot_failed', e, { userId, messageId });
   }
 }
 
@@ -2281,6 +2339,16 @@ async function processPendingMessagesAfterVerification(userId) {
   for (let i = 0; i < sortedIds.length; i++) {
     const msgId = sortedIds[i];
     try {
+      const pendingMessage = await getPendingMessageSnapshot(userId, msgId);
+      if (pendingMessage) {
+        const spamCheck = await checkSpam(pendingMessage, userId);
+        if (spamCheck.isSpam) {
+          Logger.info('pending_spam_blocked_after_verification', { userId, messageId: msgId, reason: spamCheck.reason });
+          await deletePendingMessageSnapshot(userId, msgId);
+          continue;
+        }
+      }
+
       // 尝试转发消息（通过复制方式）
       const payload = {
         chat_id: targetForPending.chatId,
@@ -2294,18 +2362,28 @@ async function processPendingMessagesAfterVerification(userId) {
       const result = await forwardMessage(payload);
 
       if (result.ok && result.result && result.result.message_id) {
-        forwarded++;
-        await storeForwardMapping(
-          result.result.message_id,
-          { chat: { id: userId }, message_id: msgId },
-          targetForPending
-        );
+        if (!isForwardedToExpectedThread(result, targetForPending)) {
+          Logger.warn('pending_forward_misdirected_thread', { userId, messageId: msgId, expectedThreadId: targetForPending.threadId, actualThreadId: result.result.message_thread_id });
+          await deleteForwardedResultMessages(result, targetForPending);
+          failed++;
+          failedMessages.push(msgId);
+        } else {
+          forwarded++;
+          await storeForwardMapping(
+            result.result.message_id,
+            { chat: { id: userId }, message_id: msgId },
+            targetForPending
+          );
+          await deletePendingMessageSnapshot(userId, msgId);
+        }
       } else if (result.ok) {
         forwarded++;
+        await deletePendingMessageSnapshot(userId, msgId);
       } else {
         // 【优化】区分错误类型：消息不存在 vs 其他错误
         if (result.description && result.description.includes('message to forward not found')) {
           Logger.warn('pending_message_not_found', { userId, messageId: msgId });
+          await deletePendingMessageSnapshot(userId, msgId);
           // 消息不存在，视为成功（不需要重试）
         } else {
           failed++;
@@ -3469,6 +3547,28 @@ function shouldFallbackToCopy(result) {
   return desc.includes('message to forward not found') || desc.includes('content private');
 }
 
+function isForwardedToExpectedThread(result, target) {
+  if (!target?.threadId || !result?.ok) return true;
+  const messages = Array.isArray(result.result) ? result.result : [result.result];
+  return messages.every(msg => msg && Number(msg.message_thread_id) === Number(target.threadId));
+}
+
+async function deleteForwardedResultMessages(result, target) {
+  if (!target?.chatId || !result?.ok) return;
+  const messages = Array.isArray(result.result) ? result.result : [result.result];
+  for (const msg of messages) {
+    if (!msg?.message_id) continue;
+    try {
+      await requestTelegram('deleteMessage', {
+        chat_id: target.chatId,
+        message_id: msg.message_id
+      });
+    } catch (e) {
+      Logger.warn('delete_misdirected_forward_failed', e, { chatId: target.chatId, messageId: msg.message_id });
+    }
+  }
+}
+
 // 设置 Telegram 命令列表
 async function setBotCommands() {
   const adminCommands = [
@@ -3637,6 +3737,19 @@ async function onMessage(message, origin) {
   // 缓存用户资料（从消息中）
   if (message.from) {
     await upsertUserProfileFromUpdate(message.from);
+  }
+
+  if (isGroupAdminChat && message.message_thread_id) {
+    if (message.forum_topic_closed) {
+      await updateThreadClosedStatus(message.message_thread_id, true);
+      Logger.info('forum_topic_closed_recorded', { threadId: message.message_thread_id });
+      return;
+    }
+    if (message.forum_topic_reopened) {
+      await updateThreadClosedStatus(message.message_thread_id, false);
+      Logger.info('forum_topic_reopened_recorded', { threadId: message.message_thread_id });
+      return;
+    }
   }
 
   // 1. 如果是管理员发消息
@@ -5234,6 +5347,7 @@ async function handleAdminMessage(message) {
   const spamTopicWaitKey = `spam_topic_config_wait:${adminChatId}`;
   const isWaitingForSpamTopicId = await KV.get(spamTopicWaitKey);
   if (isWaitingForSpamTopicId) {
+    const replyTarget = getReplyTarget();
     await KV.delete(spamTopicWaitKey);
 
     // 获取最后一个菜单消息 ID（从 KV 中存储）
@@ -5263,7 +5377,7 @@ async function handleAdminMessage(message) {
         });
       }
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '❌ 已取消配置垃圾话题 ID'
       });
     }
@@ -5289,12 +5403,12 @@ async function handleAdminMessage(message) {
         }
 
         return sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `✅ 垃圾话题已自动创建，ID: <code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
         });
       } else {
         return sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: '❌ 自动创建失败，请检查机器人是否为群组管理员'
         });
       }
@@ -5309,7 +5423,7 @@ async function handleAdminMessage(message) {
 
     if (!/^\d+$/.test(topicId)) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '❌ 无效的话题 ID，请输入纯数字或话题链接'
       });
     }
@@ -5333,7 +5447,7 @@ async function handleAdminMessage(message) {
     }
 
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: `✅ 垃圾话题 ID 已设置：<code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
     });
   }
@@ -5600,10 +5714,11 @@ async function handleAdminMessage(message) {
 
   // 指令：/broadcast - 广播消息
   if (text === '/broadcast' || text.startsWith('/broadcast ')) {
+    const replyTarget = getReplyTarget();
     const broadcastMsg = text === '/broadcast' ? '' : text.slice(10).trim();
     if (!broadcastMsg) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 格式错误。\n用法：/broadcast 消息内容\n\n支持 HTML 格式：\n<b>粗体</b> <i>斜体</i> <code>代码</code>'
       });
     }
@@ -5613,7 +5728,7 @@ async function handleAdminMessage(message) {
     if (!rateLimit.allowed) {
       const remainingHours = Math.ceil(rateLimit.retryAfter / 3600);
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: `⏳ 广播冷却中，请 ${remainingHours} 小时后再试。\n\n限额：${rateLimit.limit} 次/24 小时`
       });
     }
@@ -5629,7 +5744,7 @@ async function handleAdminMessage(message) {
       if (remainingMs > 0) {
         const remainingHours = Math.ceil(remainingMs / (60 * 60 * 1000));
         return sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `⏳ 广播冷却中，请 ${remainingHours} 小时后再试。`
         });
       }
@@ -5653,7 +5768,7 @@ async function handleAdminMessage(message) {
     inlineKeyboard.push([{ text: '❌ 取消广播', callback_data: 'bcancel' }]);
 
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}`,
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: inlineKeyboard }
@@ -5687,9 +5802,10 @@ async function handleAdminMessage(message) {
 
   // 指令：/bcancel - 取消广播（保留命令方式作为备选）
   if (text === '/bcancel') {
+    const replyTarget = getReplyTarget();
     await KV.delete(`broadcast_msg:${adminChatId}`);
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: '✅ 已取消广播'
     });
   }
@@ -5706,6 +5822,7 @@ async function handleAdminMessage(message) {
   // 指令：/cachestats - 查看缓存统计
   if (text === '/cachestats') {
     const stats = getCacheStats();
+    const replyTarget = getReplyTarget();
     const text = `📊 <b>缓存统计信息</b>\n\n` +
       `<b>L1 内存缓存：</b>\n` +
       `  命中：${stats.l1.hits}\n` +
@@ -5719,7 +5836,7 @@ async function handleAdminMessage(message) {
       `<i>提示：命中率越高，性能越好</i>`;
 
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: text,
       parse_mode: 'HTML'
     });
@@ -5727,9 +5844,10 @@ async function handleAdminMessage(message) {
 
   // 指令：/clearcache - 清空所有缓存
   if (text === '/clearcache') {
+    const replyTarget = getReplyTarget();
     clearAllCache();
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: '✅ 已清空所有缓存\n\nL1 内存缓存和统计信息已重置。\nL2 KV 缓存将在到期后自动清理。',
       parse_mode: 'HTML'
     });
@@ -5737,12 +5855,13 @@ async function handleAdminMessage(message) {
 
   // 指令：/restore - 从垃圾话题恢复消息
   if (text === '/restore' && reply) {
+    const replyTarget = getReplyTarget();
     const spamTopicConfig = await getSpamTopicConfig();
     const isTopicMode = await isTopicForwardingEnabled();
 
     if (!spamTopicConfig.topicId || !(await isSpamTopicEnabled())) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 垃圾话题功能未启用，无法恢复消息。'
       });
     }
@@ -5750,7 +5869,7 @@ async function handleAdminMessage(message) {
     const replyChatIdStr = reply.chat?.id ? String(reply.chat.id) : null;
     if (replyChatIdStr !== GROUP_ID || !reply.message_thread_id || String(reply.message_thread_id) !== String(spamTopicConfig.topicId)) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 请回复垃圾话题中的消息来恢复。\n\n提示：只有垃圾话题中的消息才能被恢复。'
       });
     }
@@ -5761,25 +5880,25 @@ async function handleAdminMessage(message) {
     if (restoreResult.success) {
       if (isTopicMode && targetThreadId) {
         await sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `✅ 消息已恢复到用户话题\n\nUID: <code>${restoreResult.guestChatId}</code>\n话题 ID: <code>${targetThreadId}</code>`,
           parse_mode: 'HTML'
         });
       } else {
         await sendMessage({
-          chat_id: adminChatId,
+          ...replyTarget,
           text: `✅ 消息已恢复并发送给用户\n\nUID: <code>${restoreResult.guestChatId}</code>`,
           parse_mode: 'HTML'
         });
       }
     } else if (restoreResult.reason === 'no_mapping') {
       await sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '⚠️ 未找到消息映射关系，无法恢复。\n\n可能原因：消息映射已过期（超过48小时）或消息不是通过垃圾话题功能转发的。'
       });
     } else {
       await sendMessage({
-        chat_id: adminChatId,
+        ...replyTarget,
         text: '❌ 恢复消息失败，请稍后重试。'
       });
     }
@@ -5841,7 +5960,7 @@ async function handleAdminMessage(message) {
       });
 
       return sendMessage({
-        chat_id: adminChatId,
+        ...(isInTopic ? { chat_id: contextChatId, message_thread_id: message.message_thread_id } : { chat_id: adminChatId }),
         text: '✅ 垃圾过滤规则已更新'
       });
     }
@@ -5853,7 +5972,7 @@ async function handleAdminMessage(message) {
     // 【修复】检查是否是回复消息但发送了无效命令
     if (isCommandLike && !isValidCommand) {
       return sendMessage({
-        chat_id: adminChatId,
+        ...(isInTopic ? { chat_id: contextChatId, message_thread_id: message.message_thread_id } : { chat_id: adminChatId }),
         text: `⚠️ 无效命令 "${text.split(' ')[0]}"\n\n请检查命令拼写，或发送 /help 查看所有可用指令。`,
         parse_mode: 'HTML'
       });
@@ -5877,14 +5996,15 @@ async function handleAdminMessage(message) {
       return copyReq;
     } else {
       return sendMessage({
-        chat_id: adminChatId,
+        ...(isInTopic ? { chat_id: contextChatId, message_thread_id: message.message_thread_id } : { chat_id: adminChatId }),
         text: '⚠️ 未找到原用户映射，可能消息太旧或被清理了缓存。'
       });
     }
   } else {
     // 既不是指令也不是回复，提示使用 /help
+    const replyTarget = getReplyTarget();
     return sendMessage({
-      chat_id: adminChatId,
+      ...replyTarget,
       text: '🤖 请发送 /help 查看所有可用指令，或直接回复用户消息进行转发。',
       parse_mode: 'HTML'
     });
@@ -6059,10 +6179,11 @@ async function handleCleanupCommand(message, options = {}, overrideChatId = null
 async function handleVerification(message, chatId, origin) {
   // 获取当前验证模式
   const verifyMode = await getVerifyMode();
+  const text = (message?.text || '').trim();
 
   // 【并发保护】暂存当前消息（如果有）
-  if (message && message.message_id) {
-    const queue = await appendPendingQueue(chatId, message.message_id);
+  if (message && message.message_id && text !== '/start') {
+    const queue = await appendPendingQueue(chatId, message);
     Logger.debug('message_queued_for_verification', { userId: chatId, messageId: message.message_id, queueLength: queue.length });
 
     // 如果队列已满，提示用户
@@ -6772,6 +6893,11 @@ async function forwardMessagesToTarget(messages, userId, target) {
 
 async function handleSingleForwardResult(result, msg, target, userId) {
   if (result.ok && result.result && result.result.message_id) {
+    if (!isForwardedToExpectedThread(result, target)) {
+      Logger.warn('single_forward_misdirected_thread', { userId, expectedThreadId: target.threadId, actualThreadId: result.result.message_thread_id });
+      await deleteForwardedResultMessages(result, target);
+      return { success: false, errorType: 'thread_not_found' };
+    }
     await storeForwardMapping(result.result.message_id, msg, target);
     return { success: true };
   }
@@ -6884,6 +7010,11 @@ async function tryCopySingleMessage(msg, target) {
 
   const copyReq = await requestTelegram('copyMessage', payload);
   if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+    if (!isForwardedToExpectedThread(copyReq, target)) {
+      Logger.warn('copy_single_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
+      await deleteForwardedResultMessages(copyReq, target);
+      return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
+    }
     await storeForwardMapping(copyReq.result.message_id, msg, target);
     return { success: true };
   }
@@ -6901,6 +7032,11 @@ async function copyMessagesIndividually(messages, target) {
 
     const copyReq = await requestTelegram('copyMessage', payload);
     if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+      if (!isForwardedToExpectedThread(copyReq, target)) {
+        Logger.warn('copy_batch_item_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
+        await deleteForwardedResultMessages(copyReq, target);
+        return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
+      }
       await storeForwardMapping(copyReq.result.message_id, msg, target);
     } else {
       return { success: false, rawResult: copyReq };

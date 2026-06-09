@@ -16,6 +16,12 @@
 | **Turnstile Site Key**   | Cloudflare Dashboard 创建                                   | 人机验证         |
 | **Turnstile Secret Key** | Cloudflare Dashboard 创建                                   | 人机验证         |
 
+如果准备使用话题模式，请提前确认：
+
+1. 在 BotFather 中关闭机器人 **Group Privacy**。
+2. 管理员群组必须是超级群组并开启 **Topics/话题** 功能。
+3. 机器人必须是群管理员，并拥有「管理话题」权限。
+
 ---
 
 ## 步骤 1：配置 Cloudflare Turnstile（必需）
@@ -26,7 +32,7 @@
 2. **小组件名称**：填写 `tgbot`（或其他名称）
 3. **主机名管理**：点击 **添加主机名** 按钮
    - 选择 **添加自定义主机名**
-   - 填写你的 Workers 域名或自己的域名，例如 `qianqi.workers.dev` 改成自己的
+   - 填写你的 Workers 域名或自己的域名，例如 `tgbot.example.workers.dev` 改成自己的
    - 点击输入框旁边的 **添加** 按钮
    - 点击下方的 **添加** 按钮确认
 4. 点击 **创建** 按钮
@@ -56,6 +62,18 @@
 2. 选择 `从 Hello World! 开始` 
 3. `Worker Name` 填写 `tgbot`（或其他你喜欢的名字）
 4. 点击 `部署`
+5. 在 Worker 页面复制你的 Worker 域名，例如 `tgbot.example.workers.dev`
+
+### 回填 Turnstile 主机名
+
+回到 `应用程序安全` → `Turnstile`：
+
+1. 找到刚才创建的小组件，点击最右侧的 **三个点** → **编辑**。
+2. 在 **主机名管理** 中添加刚才复制的 Worker 域名。
+3. 如果之前创建小组件时填写了临时/凑数主机名，请删除它。
+4. 点击页面最下方的 **更新** 按钮保存。
+
+> ⚠️ **重要**：Turnstile 的主机名必须和实际 Worker 域名一致，否则验证页面会加载失败或无法通过验证。
 
 ---
 
@@ -100,15 +118,15 @@
 | `CF_TURNSTILE_SECRET_KEY` | 密钥 | `密钥` 刚才复制到那个     |  `0x4AAAAAA...`  |
 |        `GROUP_ID`         | 文本 | 你的群组ID                | `-1001234567890` |
 
-### 可选变量 下方变量没有进行汉化 有能力的可以看看
+### 可选变量
 
-|             变量              |    类型    | 说明                                              |             示例              |
-| :---------------------------: | :--------: | :------------------------------------------------ | :---------------------------: |
-|          `ADMIN_IDS`          | Plain text | 多管理员列表；不能代替必填变量`ENV_ADMIN_UID`     |         `111,222,333`         |
-|     `WORKERS_AI_ENABLED`      | Plain text | 启用 Workers AI 垃圾检测                          |            `true`             |
-| `TURNSTILE_ALLOWED_HOSTNAMES` | Plain text | Turnstile Hostname 白名单，逗号或空格分隔         | `bot.example.com workers.dev` |
-|      `TURNSTILE_ACTION`       | Plain text | Turnstile Action 校验值                           |          `tg_verify`          |
-|    `VERIFY_SIGNING_SECRET`    |   Secret   | 自定义 HMAC 密钥（不设置则使用 `ENV_BOT_SECRET`） |       `my_sign_secret`        |
+|             变量              |  类型  | 说明                                                         |             示例              |
+| :---------------------------: | :----: | :----------------------------------------------------------- | :---------------------------: |
+|          `ADMIN_IDS`          |  文本  | 多管理员 ID 列表，用英文逗号分隔；不能代替必填变量 `ENV_ADMIN_UID` |         `111,222,333`         |
+|     `WORKERS_AI_ENABLED`      |  文本  | 是否启用 Workers AI 垃圾消息检测；填 `true` 表示启用        |            `true`             |
+| `TURNSTILE_ALLOWED_HOSTNAMES` |  文本  | Turnstile 允许验证的域名白名单，多个域名用英文逗号或空格分隔 | `tgbot.example.workers.dev` |
+|      `TURNSTILE_ACTION`       |  文本  | Turnstile 验证动作名称，通常保持默认即可                    |          `tg_verify`          |
+|    `VERIFY_SIGNING_SECRET`    |  密钥  | 验证链接签名密钥；不设置时默认使用 `ENV_BOT_SECRET`          |       `my_sign_secret`        |
 
 点击 `Save and deploy`（保存并部署）
 
@@ -121,7 +139,7 @@
 ```
 https://<你的 worker 域名>/registerWebhook
 ```
-例如： `https://tgbot.qianqi.workers.dev/registerWebhook`
+例如： `https://tgbot.example.workers.dev/registerWebhook`
 
 ---
 
